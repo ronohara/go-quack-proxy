@@ -222,6 +222,18 @@ Requirements:
 - Go 1.21+
 - DuckDB ≥ 1.5.2 (with Quack extension support)
 
+### Testing
+
+This project started as a rapid prototype — the initial development cycle prioritized manual verification (`curl`, `ps`, direct stress testing) over unit tests. The core functionality was validated in production-like conditions before any test code was written.
+
+The main bug discovered during development (`exec.CommandContext` killing child processes) was caught by manual integration testing, not unit tests — a reminder that mocking everything doesn't catch real process management bugs.
+
+Tests were added post-hoc and now cover all 5 packages (31 tests, `go test ./...` passes clean). The test suite focuses on what matters: config validation, health check logic, HAProxy output correctness, process lifecycle, and CLI argument parsing.
+
+```bash
+go test ./... -v -count=1
+```
+
 ---
 
 ## License
