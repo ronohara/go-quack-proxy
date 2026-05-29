@@ -1,0 +1,18 @@
+# Build
+/quack-proxy
+/quack-proxy.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+/tmp/
+*.pid
+status.json

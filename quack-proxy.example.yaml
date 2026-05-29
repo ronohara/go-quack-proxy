@@ -1,0 +1,18 @@
+# quack-proxy.yaml — example configuration
+
+global:
+  log_level: info
+  pid_file: /tmp/quack-proxy/quack-proxy.pid
+  status_file: /tmp/quack-proxy/status.json
+
+listener:
+  bind_host: 0.0.0.0
+  port_start: 9491
+  health_interval: 5s
+
+shards:
+  - name: analytics
+    database: /tmp/quack-proxy/analytics.db
+
+  - name: logs
+    database: /tmp/quack-proxy/logs.db
