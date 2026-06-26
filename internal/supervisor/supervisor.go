@@ -17,8 +17,6 @@ import (
 )
 
 const quackBootSQL = `
-INSTALL quack FROM core_nightly;
-LOAD quack;
 CALL quack_serve('quack:%s:%d', token = '%s', allow_other_hostname = true);
 `
 
@@ -131,7 +129,7 @@ func (s *Supervisor) stopShardLocked(name string, sp *ShardProcess) {
 }
 
 func (s *Supervisor) HealthLoop(ctx context.Context) {
-	// Initial grace period: give DuckDB time to install extensions and start Quack
+	// Initial grace period: give DuckDB time to start Quack
 	select {
 	case <-ctx.Done():
 		return
