@@ -4,7 +4,6 @@ package supervisor
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/alitrack/quack-proxy/internal/config"
 	"github.com/alitrack/quack-proxy/internal/health"
+	"github.com/alitrack/quack-proxy/internal/logger"
 )
 
 const quackBootSQL = `
@@ -24,7 +24,7 @@ type Supervisor struct {
 	cfg    *config.Config
 	shards map[string]*ShardProcess
 	mu     sync.RWMutex
-	logger *slog.Logger
+	logger *logger.Logger
 	cancel context.CancelFunc
 }
 
@@ -38,11 +38,11 @@ type ShardProcess struct {
 	lastCheck time.Time
 }
 
-func New(cfg *config.Config, logger *slog.Logger) *Supervisor {
+func New(cfg *config.Config, log *logger.Logger) *Supervisor {
 	return &Supervisor{
 		cfg:    cfg,
 		shards: make(map[string]*ShardProcess),
-		logger: logger,
+		logger: log,
 	}
 }
 
@@ -58,7 +58,7 @@ func (s *Supervisor) StartAll(ctx context.Context) error {
 		}
 	}
 
-	s.logger.Info("all shards started", "count", len(s.shards))
+	s.logger.Infof("all shards started, count: %d", len(s.shards))
 	return nil
 }
 
@@ -66,9 +66,14 @@ func (s *Supervisor) startShardLocked(ctx context.Context, cfg config.ShardConfi
 	token := cfg.Token
 	if token == "" {
 		token = randomToken(32)
+		s.logger.Verbosef("generated random token for shard '%s'", cfg.Name)
 	}
 
 	sql := fmt.Sprintf(quackBootSQL, s.cfg.Listener.BindHost, cfg.Port, token)
+
+	if s.logger.IsDebug() {
+		s.logger.Debugf("SQL for shard '%s': %s", cfg.Name, strings.TrimSpace(sql))
+	}
 
 	// Use shell pipe trick: pipe init SQL then keep stdin open via
 	// tail -f /dev/null so duckdb stays alive serving Quack indefinitely.
@@ -77,6 +82,8 @@ func (s *Supervisor) startShardLocked(ctx context.Context, cfg config.ShardConfi
 		strings.ReplaceAll(sql, "'", "'\\''"),
 		cfg.Database,
 	)
+
+	s.logger.Verbosef("starting shard '%s' on port %d, database: %s", cfg.Name, cfg.Port, cfg.Database)
 
 	cmd := exec.Command("bash", "-c", shellCmd)
 	cmd.Stdout = os.Stdout
@@ -87,6 +94,8 @@ func (s *Supervisor) startShardLocked(ctx context.Context, cfg config.ShardConfi
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start duckdb: %w", err)
 	}
+
+	s.logger.Verbosef("shard '%s' started with PID %d", cfg.Name, cmd.Process.Pid)
 
 	sp := &ShardProcess{
 		Config:    cfg,
@@ -114,26 +123,33 @@ func (s *Supervisor) StopAll() {
 }
 
 func (s *Supervisor) stopShardLocked(name string, sp *ShardProcess) {
+	s.logger.Verbosef("stopping shard '%s' (PID %d)", name, sp.PID)
 	if sp.cmd != nil && sp.cmd.Process != nil {
 		sp.cmd.Process.Signal(syscall.SIGTERM)
 		done := make(chan error, 1)
 		go func() { done <- sp.cmd.Wait() }()
 		select {
 		case <-done:
+			s.logger.Verbosef("shard '%s' stopped gracefully", name)
 		case <-time.After(10 * time.Second):
+			s.logger.Warnf("shard '%s' did not stop, killing", name)
 			sp.cmd.Process.Kill()
 		}
 	}
 	sp.Status = "stopped"
-	s.logger.Info("shard stopped", "name", name)
+	s.logger.Infof("shard stopped: %s", name)
 }
 
 func (s *Supervisor) HealthLoop(ctx context.Context) {
+	s.logger.Verbosef("health loop started, interval: %v", s.cfg.Listener.HealthInterval)
+
 	// Initial grace period: give DuckDB time to start Quack
 	select {
 	case <-ctx.Done():
+		s.logger.Verbosef("health loop canceled during grace period")
 		return
 	case <-time.After(15 * time.Second):
+		s.logger.Verbosef("grace period completed, starting health checks")
 	}
 
 	ticker := time.NewTicker(s.cfg.Listener.HealthInterval)
@@ -142,6 +158,7 @@ func (s *Supervisor) HealthLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			s.logger.Verbosef("health loop canceled")
 			return
 		case <-ticker.C:
 			s.checkAll(ctx)
@@ -157,21 +174,37 @@ func (s *Supervisor) checkAll(ctx context.Context) {
 		if sp.Status == "stopped" {
 			continue
 		}
+
+		host := s.cfg.Listener.BindHost
+		if host == "0.0.0.0" {
+			host = "127.0.0.1"
+		}
+
+		if s.logger.IsDebug() {
+			s.logger.Debugf("health check for shard '%s': http://%s:%d%s",
+				name, host, sp.Config.Port, s.cfg.Listener.HealthPath)
+		}
+
 		ok := health.Check(
-			s.cfg.Listener.BindHost,
+			host,
 			sp.Config.Port,
 			s.cfg.Listener.HealthPath,
 			2*time.Second,
 		)
 		sp.lastCheck = time.Now()
+
 		if ok {
+			if sp.Status != "healthy" {
+				s.logger.Infof("shard '%s' is now healthy", name)
+			}
 			sp.Status = "healthy"
 		} else {
 			sp.Status = "unhealthy"
-			s.logger.Warn("shard unhealthy, restarting", "name", name)
+			s.logger.Warnf("shard '%s' is unhealthy, restarting (restart count: %d)",
+				name, sp.Restarts+1)
 			s.stopShardLocked(name, sp)
 			if err := s.startShardLocked(ctx, sp.Config); err != nil {
-				s.logger.Error("failed to restart shard", "name", name, "error", err)
+				s.logger.Errorf("failed to restart shard '%s': %v", name, err)
 			}
 			sp.Restarts++
 		}

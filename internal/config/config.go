@@ -4,8 +4,10 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
+	"github.com/alitrack/quack-proxy/internal/logger"
 	"gopkg.in/yaml.v3"
 )
 
@@ -50,7 +52,8 @@ type SSLConfig struct {
 	Cert    string `yaml:"cert"`
 }
 
-func Load(path string) (*Config, error) {
+// Load reads and parses the config file, resolving paths relative to baseDir.
+func Load(path string, baseDir string, log *logger.Logger) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
@@ -61,23 +64,27 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
-	cfg.applyDefaults()
+	cfg.applyDefaults(baseDir)
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate config: %w", err)
+	}
+
+	if log != nil {
+		log.Verbosef("config loaded: %d shard(s)", len(cfg.Shards))
 	}
 
 	return cfg, nil
 }
 
-func (c *Config) applyDefaults() {
+func (c *Config) applyDefaults(baseDir string) {
 	if c.Global.LogLevel == "" {
 		c.Global.LogLevel = "info"
 	}
 	if c.Global.PIDFile == "" {
-		c.Global.PIDFile = "/var/run/quack-proxy/quack-proxy.pid"
+		c.Global.PIDFile = filepath.Join(baseDir, "run", "quack-proxy.pid")
 	}
 	if c.Global.StatusFile == "" {
-		c.Global.StatusFile = "/var/run/quack-proxy/status.json"
+		c.Global.StatusFile = filepath.Join(baseDir, "run", "status.json")
 	}
 	if c.Listener.BindHost == "" {
 		c.Listener.BindHost = "0.0.0.0"
@@ -91,14 +98,34 @@ func (c *Config) applyDefaults() {
 	if c.Listener.HealthInterval == 0 {
 		c.Listener.HealthInterval = 5 * time.Second
 	}
+
+	// Resolve paths relative to baseDir
+	c.Global.PIDFile = resolvePath(c.Global.PIDFile, baseDir)
+	c.Global.StatusFile = resolvePath(c.Global.StatusFile, baseDir)
+
 	for i := range c.Shards {
 		if c.Shards[i].Port == 0 {
 			c.Shards[i].Port = c.Listener.PortStart + i
 		}
+		c.Shards[i].Database = resolvePath(c.Shards[i].Database, baseDir)
 	}
+
 	if c.Proxy != nil && c.Proxy.Mode == "" {
 		c.Proxy.Mode = "roundrobin"
 	}
+	if c.Proxy != nil && c.Proxy.Output != "" {
+		c.Proxy.Output = resolvePath(c.Proxy.Output, baseDir)
+	}
+}
+
+func resolvePath(path, baseDir string) string {
+	if path == "" {
+		return ""
+	}
+	if filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(baseDir, path)
 }
 
 func (c *Config) Validate() error {
@@ -114,9 +141,6 @@ func (c *Config) Validate() error {
 		if s.Database == "" {
 			return fmt.Errorf("shard[%d] (%s): database path is required", i, s.Name)
 		}
-		if _, err := os.Stat(s.Database); os.IsNotExist(err) {
-			return fmt.Errorf("shard[%d] (%s): database file not found: %s", i, s.Name, s.Database)
-		}
 		if s.Port <= 0 || s.Port > 65535 {
 			return fmt.Errorf("shard[%d] (%s): invalid port %d", i, s.Name, s.Port)
 		}
@@ -126,5 +150,21 @@ func (c *Config) Validate() error {
 		ports[s.Port] = true
 	}
 
+	return nil
+}
+
+// ValidateDatabases checks that all database files exist.
+func (c *Config) ValidateDatabases(log *logger.Logger) error {
+	for _, s := range c.Shards {
+		if log != nil {
+			log.Verbosef("checking database: %s", s.Database)
+		}
+		if _, err := os.Stat(s.Database); os.IsNotExist(err) {
+			return fmt.Errorf("database file not found: %s", s.Database)
+		}
+	}
+	if log != nil {
+		log.Verbosef("all databases validated")
+	}
 	return nil
 }
