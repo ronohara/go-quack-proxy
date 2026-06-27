@@ -1,0 +1,14 @@
+global:
+  log_level: info
+  pid_file: /tmp/quack-proxy/quack-proxy.pid
+  status_file: /tmp/quack-proxy/status.json
+
+listener:
+  bind_host: 0.0.0.0
+  port_start: 9491
+  health_interval: 5s
+
+shards:
+  - name: workbench
+    database: /home/rono/my-shadcn/backend/quack-proxy/config/quack_data.duckdb
+    token: super_secret
