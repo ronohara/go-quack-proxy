@@ -1,2 +1,0 @@
-time=2026-06-27T08:05:06.568+07:00 level=INFO msg="This should go to both stdout and file"
-time=2026-06-27T08:05:06.568+07:00 level=INFO msg="Second message"

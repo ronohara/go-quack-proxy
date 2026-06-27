@@ -1,5 +1,0 @@
-time=2026-06-27T08:12:43.402+07:00 level=INFO msg="Logger initialized with log file: quack-test.log"
-time=2026-06-27T08:12:43.402+07:00 level=INFO msg="Starting quack-proxy v0.1.0"
-time=2026-06-27T08:12:43.403+07:00 level=INFO msg="all shards started, count: 1"
-time=2026-06-27T08:13:03.422+07:00 level=INFO msg="shard 'workbench' is now healthy"
-time=2026-06-27T08:13:10.019+07:00 level=INFO msg="shutting down, signal: interrupt"
