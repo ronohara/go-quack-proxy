@@ -2,24 +2,30 @@ package supervisor
 
 import (
 	"context"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/alitrack/quack-proxy/internal/config"
+	"github.com/alitrack/quack-proxy/internal/logger"
 )
+
+func newTestLogger(level logger.Level) *logger.Logger {
+	lg, err := logger.New(logger.Config{Level: level})
+	if err != nil {
+		panic(err)
+	}
+	return lg
+}
 
 func TestNewSupervisor(t *testing.T) {
 	cfg := &config.Config{
 		Listener: config.ListenerConfig{BindHost: "0.0.0.0", HealthPath: "/", HealthInterval: 5 * time.Second},
 		Shards:   []config.ShardConfig{{Name: "test", Database: "/tmp/test.db", Port: 9491}},
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	sup := New(cfg, logger)
+	sup := New(cfg, newTestLogger(logger.LevelInfo))
 
 	if len(sup.shards) != 0 {
 		t.Error("new supervisor should have empty shards map")
@@ -34,8 +40,7 @@ func TestAttachSQL(t *testing.T) {
 			{Name: "logs", Database: "/tmp/l.db", Port: 9492},
 		},
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	sup := New(cfg, logger)
+	sup := New(cfg, newTestLogger(logger.LevelInfo))
 
 	// No shards started, so AttachSQL should be empty
 	sql := sup.AttachSQL()
@@ -47,7 +52,6 @@ func TestAttachSQL(t *testing.T) {
 func TestStartShardLocked(t *testing.T) {
 	tmp := t.TempDir()
 	dbPath := filepath.Join(tmp, "test.db")
-	os.WriteFile(dbPath, []byte{}, 0644)
 
 	cfg := &config.Config{
 		Listener: config.ListenerConfig{BindHost: "127.0.0.1", HealthPath: "/", HealthInterval: 5 * time.Second},
@@ -55,8 +59,7 @@ func TestStartShardLocked(t *testing.T) {
 			{Name: "testshard", Database: dbPath, Port: 9499},
 		},
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	sup := New(cfg, logger)
+	sup := New(cfg, newTestLogger(logger.LevelDebug))
 
 	ctx := context.Background()
 	if err := sup.startShardLocked(ctx, cfg.Shards[0]); err != nil {
@@ -72,8 +75,8 @@ func TestStartShardLocked(t *testing.T) {
 		t.Errorf("status = %q, want starting", sp.Status)
 	}
 
-	if sp.PID <= 0 {
-		t.Errorf("PID = %d, want > 0", sp.PID)
+	if sp.db == nil {
+		t.Error("db = nil, want an open in-process DuckDB instance")
 	}
 
 	if sp.Config.Token == "" {
@@ -92,8 +95,7 @@ func TestStatus(t *testing.T) {
 			{Name: "s2", Database: "/tmp/s2.db", Port: 9492},
 		},
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	sup := New(cfg, logger)
+	sup := New(cfg, newTestLogger(logger.LevelInfo))
 
 	status := sup.Status()
 	if len(status) != 0 {
@@ -110,7 +112,6 @@ func TestHealthCheckIntegration(t *testing.T) {
 
 	tmp := t.TempDir()
 	dbPath := filepath.Join(tmp, "test.db")
-	os.WriteFile(dbPath, []byte{}, 0644)
 
 	testPort := 19503 // Use a port that isn't the fake server
 
@@ -124,8 +125,7 @@ func TestHealthCheckIntegration(t *testing.T) {
 			{Name: "healthy-shard", Database: dbPath, Port: testPort},
 		},
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	sup := New(cfg, logger)
+	sup := New(cfg, newTestLogger(logger.LevelInfo))
 
 	// Manually insert a "healthy" shard entry pointing to our fake server
 	sup.mu.Lock()
@@ -156,8 +156,7 @@ func TestStopAllCleansUp(t *testing.T) {
 		Listener: config.ListenerConfig{BindHost: "127.0.0.1", HealthPath: "/", HealthInterval: 5 * time.Second},
 		Shards:   []config.ShardConfig{},
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	sup := New(cfg, logger)
+	sup := New(cfg, newTestLogger(logger.LevelInfo))
 
 	// StopAll on empty supervisor should not panic
 	sup.StopAll()

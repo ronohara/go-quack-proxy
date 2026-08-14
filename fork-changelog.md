@@ -1,5 +1,43 @@
 # quack-proxy Changelog
 
+## v0.2.0 – 2026-08-15 — Option B: in-process DuckDB engine
+
+### Added
+- `init-db` subcommand: creates missing shard database files and verifies
+  existing ones are valid DuckDB databases, using the in-process engine
+  (replaces the duckdb.exe CLI bootstrap — Option B has no CLI)
+- In-process DuckDB engine via `github.com/duckdb/duckdb-go/v2` v2.10505.0
+  (CGo-linked libduckdb)
+- Automatic creation of missing parent directories for shard database files
+
+### Changed
+- Supervisor architecture: each shard now runs the Quack server INSIDE the
+  quack-proxy process via `CALL quack_serve(...)` — no `duckdb` CLI child
+  process, no bash pipe, no stdin keep-alive
+- Shard lifecycle: one `*sql.DB` handle per shard; closing the handle stops
+  the Quack server (replaces SIGTERM/SIGKILL process management and PID
+  tracking)
+- Supervisor tests updated for the in-process engine (internal logger, `sp.db`
+  instead of PID, no pre-created empty database files)
+- `go.mod`/`go.sum`: added duckdb-go/v2 plus indirect dependencies
+  (arrow-go, per-platform duckdb bindings)
+
+### Removed
+- `internal/supervisor/attr_unix.go` and `attr_windows.go` — child-process
+  group attributes no longer needed
+- All child-process management code (`exec.Cmd`, shell pipeline, process
+  groups, PID tracking)
+- Tracked runtime database files `config/quack_data.duckdb` and
+  `config/quack_data.duckdb.wal` — untracked from version control; both
+  (plus `AGENTS.md`) added to `.gitignore`
+
+### Known Issues
+- Test files in `cmd`, `internal/config`, and `internal/proxy` do not compile
+  against the current APIs (pre-existing upstream drift at `ea3b0eb`;
+  production code builds cleanly)
+
+---
+
 ## v0.1.1 – 2026-06-27
 
 ### Added

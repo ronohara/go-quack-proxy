@@ -11,9 +11,13 @@
 # OS
 .DS_Store
 Thumbs.db
+config/quack_data.duckdb
+config/quack_data.duckdb.wal
+
 
 # Test artifacts
 /tmp/
 *.pid
 status.json
 dist/
+AGENTS.md

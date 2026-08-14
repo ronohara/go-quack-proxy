@@ -1,15 +1,24 @@
-// Package supervisor manages DuckDB+Quack child processes.
+// Package supervisor manages in-process DuckDB Quack servers.
+//
+// Option B architecture: each shard runs the Quack server INSIDE the
+// quack-proxy process, via the CGo-linked libduckdb (duckdb-go/v2).
+// No duckdb.exe child process, no stdin keep-alive, no console — the
+// CALL quack_serve(...) statement detaches a server that lives as long
+// as its *sql.DB handle stays open. Closing the handle stops the server.
+// This is platform-independent by construction.
 package supervisor
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
+
+	_ "github.com/duckdb/duckdb-go/v2" // in-process DuckDB engine (CGo)
 
 	"github.com/alitrack/quack-proxy/internal/config"
 	"github.com/alitrack/quack-proxy/internal/health"
@@ -30,9 +39,8 @@ type Supervisor struct {
 
 type ShardProcess struct {
 	Config    config.ShardConfig
-	cmd       *exec.Cmd
-	PID       int
-	Status    string // "starting", "healthy", "unhealthy", "stopped"
+	db        *sql.DB // in-process DuckDB instance; Quack serves while this is open
+	Status    string  // "starting", "healthy", "unhealthy", "stopped"
 	StartTime time.Time
 	Restarts  int
 	lastCheck time.Time
@@ -69,38 +77,41 @@ func (s *Supervisor) startShardLocked(ctx context.Context, cfg config.ShardConfi
 		s.logger.Verbosef("generated random token for shard '%s'", cfg.Name)
 	}
 
-	sql := fmt.Sprintf(quackBootSQL, s.cfg.Listener.BindHost, cfg.Port, token)
+	bootSQL := fmt.Sprintf(quackBootSQL, s.cfg.Listener.BindHost, cfg.Port, token)
 
 	if s.logger.IsDebug() {
-		s.logger.Debugf("SQL for shard '%s': %s", cfg.Name, strings.TrimSpace(sql))
+		s.logger.Debugf("SQL for shard '%s': %s", cfg.Name, strings.TrimSpace(bootSQL))
 	}
-
-	// Use shell pipe trick: pipe init SQL then keep stdin open via
-	// tail -f /dev/null so duckdb stays alive serving Quack indefinitely.
-	shellCmd := fmt.Sprintf(
-		`(echo '%s'; tail -f /dev/null) | duckdb '%s'`,
-		strings.ReplaceAll(sql, "'", "'\\''"),
-		cfg.Database,
-	)
 
 	s.logger.Verbosef("starting shard '%s' on port %d, database: %s", cfg.Name, cfg.Port, cfg.Database)
 
-	cmd := exec.Command("bash", "-c", shellCmd)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.SysProcAttr = setProcessGroup()
-	cmd.Cancel = nil // disable CommandContext's internal context kill goroutine
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start duckdb: %w", err)
+	// The engine creates missing FILES, but not missing DIRECTORIES —
+	// ensure the database's parent directory exists first (same guarantee
+	// as init-db, so a deleted data\ dir cannot brick restarts).
+	if err := os.MkdirAll(filepath.Dir(cfg.Database), 0755); err != nil {
+		return fmt.Errorf("create directory for %s: %w", cfg.Database, err)
 	}
 
-	s.logger.Verbosef("shard '%s' started with PID %d", cfg.Name, cmd.Process.Pid)
+	// Open the in-process DuckDB instance for this shard. A single
+	// pooled connection guarantees one engine per shard.
+	db, err := sql.Open("duckdb", cfg.Database)
+	if err != nil {
+		return fmt.Errorf("open duckdb %s: %w", cfg.Database, err)
+	}
+	db.SetMaxOpenConns(1)
+
+	// Start the detached Quack server. The statement returns immediately;
+	// the server keeps serving while the db handle stays open.
+	if _, err := db.Exec(bootSQL); err != nil {
+		db.Close()
+		return fmt.Errorf("start quack server on port %d: %w", cfg.Port, err)
+	}
+
+	s.logger.Verbosef("shard '%s' serving in-process on port %d", cfg.Name, cfg.Port)
 
 	sp := &ShardProcess{
 		Config:    cfg,
-		cmd:       cmd,
-		PID:       cmd.Process.Pid,
+		db:        db,
 		Status:    "starting",
 		StartTime: time.Now(),
 	}
@@ -123,18 +134,13 @@ func (s *Supervisor) StopAll() {
 }
 
 func (s *Supervisor) stopShardLocked(name string, sp *ShardProcess) {
-	s.logger.Verbosef("stopping shard '%s' (PID %d)", name, sp.PID)
-	if sp.cmd != nil && sp.cmd.Process != nil {
-		sp.cmd.Process.Signal(syscall.SIGTERM)
-		done := make(chan error, 1)
-		go func() { done <- sp.cmd.Wait() }()
-		select {
-		case <-done:
-			s.logger.Verbosef("shard '%s' stopped gracefully", name)
-		case <-time.After(10 * time.Second):
-			s.logger.Warnf("shard '%s' did not stop, killing", name)
-			sp.cmd.Process.Kill()
+	s.logger.Verbosef("stopping shard '%s'", name)
+	if sp.db != nil {
+		// Closing the database handle stops the in-process Quack server.
+		if err := sp.db.Close(); err != nil {
+			s.logger.Warnf("shard '%s' close error: %v", name, err)
 		}
+		sp.db = nil
 	}
 	sp.Status = "stopped"
 	s.logger.Infof("shard stopped: %s", name)
@@ -143,7 +149,7 @@ func (s *Supervisor) stopShardLocked(name string, sp *ShardProcess) {
 func (s *Supervisor) HealthLoop(ctx context.Context) {
 	s.logger.Verbosef("health loop started, interval: %v", s.cfg.Listener.HealthInterval)
 
-	// Initial grace period: give DuckDB time to start Quack
+	// Initial grace period: give the Quack servers time to start.
 	select {
 	case <-ctx.Done():
 		s.logger.Verbosef("health loop canceled during grace period")
@@ -221,7 +227,7 @@ func (s *Supervisor) Status() []ShardProcess {
 	return result
 }
 
-// ManualSetShard is a test helper to inject shard state without starting a real DuckDB process.
+// ManualSetShard is a test helper to inject shard state without starting a real DuckDB engine.
 func (s *Supervisor) ManualSetShard(name string, sp ShardProcess) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

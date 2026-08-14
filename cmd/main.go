@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	_ "github.com/duckdb/duckdb-go/v2" // in-process DuckDB engine (CGo)
 
 	"github.com/alitrack/quack-proxy/internal/config"
 	"github.com/alitrack/quack-proxy/internal/logger"
@@ -85,8 +88,10 @@ func main() {
 		runReload(cfgPath, log)
 	case "gen-proxy":
 		runGenProxy(cfgPath, log)
+	case "init-db":
+		runInitDB(cfgPath, baseDir, log)
 	case "version":
-		fmt.Println("quack-proxy v0.1.0")
+		fmt.Println("quack-proxy v0.2.0")
 	default:
 		log.Errorf("unknown command: %s", args[0])
 		usage()
@@ -133,6 +138,7 @@ Usage:
   quack-proxy status [-c config.yaml]     Show shard status
   quack-proxy reload [-c config.yaml]     Hot-reload configuration
   quack-proxy gen-proxy [-c config.yaml]  Generate HAProxy config
+  quack-proxy init-db [-c config.yaml]    Create/verify shard database files
   quack-proxy version                     Print version
 
 Options:
@@ -145,8 +151,55 @@ Options:
 `)
 }
 
+// runInitDB creates any missing shard database files using the in-process
+// DuckDB engine and verifies existing ones are valid DuckDB databases.
+// This replaces the duckdb.exe CLI bootstrap — Option B has no CLI.
+func runInitDB(cfgPath string, baseDir string, log *logger.Logger) {
+	cfg, err := config.Load(cfgPath, baseDir, log)
+	if err != nil {
+		log.Errorf("failed to load config: %v", err)
+		os.Exit(1)
+	}
+
+	for _, s := range cfg.Shards {
+		existed := true
+		if _, err := os.Stat(s.Database); os.IsNotExist(err) {
+			existed = false
+		}
+
+		// The engine creates missing FILES, but not missing DIRECTORIES —
+		// ensure the database's parent directory exists first.
+		if err := os.MkdirAll(filepath.Dir(s.Database), 0755); err != nil {
+			log.Errorf("shard '%s': create directory for %s: %v", s.Name, s.Database, err)
+			os.Exit(1)
+		}
+
+		db, err := sql.Open("duckdb", s.Database)
+		if err != nil {
+			log.Errorf("shard '%s': open %s: %v", s.Name, s.Database, err)
+			os.Exit(1)
+		}
+		db.SetMaxOpenConns(1)
+		// Force real initialization — sql.Open is lazy and the file is
+		// only created/validated on first use.
+		if _, err := db.Exec("SELECT 1"); err != nil {
+			db.Close()
+			log.Errorf("shard '%s': %s is not a valid DuckDB database: %v", s.Name, s.Database, err)
+			os.Exit(1)
+		}
+		db.Close()
+
+		if existed {
+			log.Infof("shard '%s': verified %s", s.Name, s.Database)
+		} else {
+			log.Infof("shard '%s': created %s", s.Name, s.Database)
+		}
+	}
+	log.Infof("database initialisation complete")
+}
+
 func runStart(cfgPath string, baseDir string, log *logger.Logger) {
-	log.Infof("Starting quack-proxy v0.1.0")
+	log.Infof("Starting quack-proxy v0.2.0")
 	log.Verbosef("config file: %s", cfgPath)
 
 	cfg, err := config.Load(cfgPath, baseDir, log)
