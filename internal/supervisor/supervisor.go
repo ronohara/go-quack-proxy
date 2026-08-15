@@ -29,6 +29,11 @@ const quackBootSQL = `
 CALL quack_serve('quack:%s:%d', token = '%s', allow_other_hostname = true);
 `
 
+// maxConsecutiveFailures is the give-up threshold: after this many
+// consecutive failed restart attempts a shard is marked "stopped" until
+// re-armed (SIGHUP reload).
+const maxConsecutiveFailures = 10
+
 type Supervisor struct {
 	cfg    *config.Config
 	shards map[string]*ShardProcess
@@ -38,12 +43,15 @@ type Supervisor struct {
 }
 
 type ShardProcess struct {
-	Config    config.ShardConfig
-	db        *sql.DB // in-process DuckDB instance; Quack serves while this is open
-	Status    string  // "starting", "healthy", "unhealthy", "stopped"
-	StartTime time.Time
-	Restarts  int
-	lastCheck time.Time
+	Config              config.ShardConfig
+	db                  *sql.DB // in-process DuckDB instance; Quack serves while this is open
+	Status              string  // "starting", "healthy", "unhealthy", "stopped"
+	StartTime           time.Time
+	Restarts            int
+	Error               string // last start failure; empty while the shard is running
+	consecutiveFailures int
+	nextRetry           time.Time
+	lastCheck           time.Time
 }
 
 func New(cfg *config.Config, log *logger.Logger) *Supervisor {
@@ -60,20 +68,42 @@ func (s *Supervisor) StartAll(ctx context.Context) error {
 
 	ctx, s.cancel = context.WithCancel(ctx)
 
+	// Non-fatal start: one bad shard must not take the proxy — or the
+	// admin endpoint and the other shards — down with it. Every shard is
+	// registered up front; failures are recorded (unhealthy + error) and
+	// retried by the health loop.
 	for _, shardCfg := range s.cfg.Shards {
-		if err := s.startShardLocked(ctx, shardCfg); err != nil {
-			return fmt.Errorf("start %s: %w", shardCfg.Name, err)
+		sp := &ShardProcess{Config: shardCfg, Status: "starting", StartTime: time.Now()}
+		s.shards[shardCfg.Name] = sp
+		if err := s.startShardLocked(sp); err != nil {
+			s.logger.Errorf("shard '%s' failed to start: %v", shardCfg.Name, err)
+			sp.Status = "unhealthy"
+			sp.Error = err.Error()
 		}
 	}
 
-	s.logger.Infof("all shards started, count: %d", len(s.shards))
+	ready, failed := 0, 0
+	for _, sp := range s.shards {
+		if sp.db != nil {
+			ready++
+		} else {
+			failed++
+		}
+	}
+	s.logger.Infof("shards started: %d ready, %d failed", ready, failed)
 	return nil
 }
 
-func (s *Supervisor) startShardLocked(ctx context.Context, cfg config.ShardConfig) error {
+// startShardLocked opens the in-process DuckDB engine and starts the Quack
+// server for the shard. It updates sp in place so identity and Restarts are
+// preserved across attempts. The caller must hold s.mu.
+func (s *Supervisor) startShardLocked(sp *ShardProcess) error {
+	cfg := sp.Config
 	token := cfg.Token
 	if token == "" {
 		token = randomToken(32)
+		cfg.Token = token
+		sp.Config = cfg
 		s.logger.Verbosef("generated random token for shard '%s'", cfg.Name)
 	}
 
@@ -109,14 +139,9 @@ func (s *Supervisor) startShardLocked(ctx context.Context, cfg config.ShardConfi
 
 	s.logger.Verbosef("shard '%s' serving in-process on port %d", cfg.Name, cfg.Port)
 
-	sp := &ShardProcess{
-		Config:    cfg,
-		db:        db,
-		Status:    "starting",
-		StartTime: time.Now(),
-	}
-	sp.Config.Token = token
-	s.shards[cfg.Name] = sp
+	sp.db = db
+	sp.Status = "starting"
+	sp.StartTime = time.Now()
 	return nil
 }
 
@@ -181,6 +206,13 @@ func (s *Supervisor) checkAll(ctx context.Context) {
 			continue
 		}
 
+		// A shard without a database handle (failed start) cannot be
+		// health-checked — retry its start instead.
+		if sp.db == nil {
+			s.restartShardLocked(name, sp)
+			continue
+		}
+
 		host := s.cfg.Listener.BindHost
 		if host == "0.0.0.0" {
 			host = "127.0.0.1"
@@ -204,15 +236,59 @@ func (s *Supervisor) checkAll(ctx context.Context) {
 				s.logger.Infof("shard '%s' is now healthy", name)
 			}
 			sp.Status = "healthy"
+			sp.Error = ""
 		} else {
+			s.restartShardLocked(name, sp)
+		}
+	}
+}
+
+// restartShardLocked stops and restarts a shard in place: the existing
+// ShardProcess is kept, so Restarts accumulates across attempts, and a
+// failed restart leaves the shard "unhealthy" in the retry set (never
+// "stopped", which the health loop would skip forever). Retry attempts
+// follow exponential backoff (1s → 30s cap), and after maxConsecutiveFailures
+// the shard is marked "stopped" with its last error (re-armed by ReArm).
+func (s *Supervisor) restartShardLocked(name string, sp *ShardProcess) {
+	// Backoff gate: skip attempts until the retry window opens.
+	if time.Now().Before(sp.nextRetry) {
+		return
+	}
+
+	s.logger.Warnf("shard '%s' is unhealthy, restarting (restart count: %d)", name, sp.Restarts+1)
+	s.stopShardLocked(name, sp)
+	err := s.startShardLocked(sp)
+	sp.Restarts++
+	if err != nil {
+		sp.consecutiveFailures++
+		if sp.consecutiveFailures >= maxConsecutiveFailures {
+			s.logger.Errorf("shard '%s' failed %d consecutive restarts — giving up: %v", name, sp.consecutiveFailures, err)
+			sp.Status = "stopped"
+			sp.Error = err.Error()
+			return
+		}
+		s.logger.Errorf("failed to restart shard '%s': %v", name, err)
+		sp.Status = "unhealthy"
+		sp.Error = err.Error()
+		sp.nextRetry = time.Now().Add(retryBackoff(sp.consecutiveFailures))
+		return
+	}
+	sp.consecutiveFailures = 0
+	sp.nextRetry = time.Time{}
+	sp.Error = ""
+}
+
+// ReArm resets shards that gave up back into the retry set. Called on
+// SIGHUP config reload.
+func (s *Supervisor) ReArm() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for name, sp := range s.shards {
+		if sp.Status == "stopped" {
+			s.logger.Infof("re-arming shard '%s'", name)
 			sp.Status = "unhealthy"
-			s.logger.Warnf("shard '%s' is unhealthy, restarting (restart count: %d)",
-				name, sp.Restarts+1)
-			s.stopShardLocked(name, sp)
-			if err := s.startShardLocked(ctx, sp.Config); err != nil {
-				s.logger.Errorf("failed to restart shard '%s': %v", name, err)
-			}
-			sp.Restarts++
+			sp.consecutiveFailures = 0
+			sp.nextRetry = time.Now()
 		}
 	}
 }
@@ -255,4 +331,17 @@ func randomToken(n int) string {
 		b[i] = letters[time.Now().UnixNano()%int64(len(letters))]
 	}
 	return string(b)
+}
+
+// retryBackoff returns the delay before the next restart attempt after n
+// consecutive failed attempts: 1s, 2s, 4s, … capped at 30s.
+func retryBackoff(n int) time.Duration {
+	delay := time.Second
+	for i := 1; i < n; i++ {
+		delay *= 2
+		if delay >= 30*time.Second {
+			return 30 * time.Second
+		}
+	}
+	return delay
 }

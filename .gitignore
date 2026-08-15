@@ -21,3 +21,6 @@ config/quack_data.duckdb.wal
 status.json
 dist/
 AGENTS.md
+
+# Session artifacts
+context-transfer-*.md

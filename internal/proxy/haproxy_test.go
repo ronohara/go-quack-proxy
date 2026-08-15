@@ -1,15 +1,23 @@
 package proxy
 
 import (
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/alitrack/quack-proxy/internal/config"
+	"github.com/alitrack/quack-proxy/internal/logger"
 	"github.com/alitrack/quack-proxy/internal/supervisor"
 )
+
+func newTestLogger() *logger.Logger {
+	log, err := logger.New(logger.Config{Level: logger.LevelQuiet})
+	if err != nil {
+		panic(err)
+	}
+	return log
+}
 
 func TestGenerateHAProxy(t *testing.T) {
 	tmp := t.TempDir()
@@ -32,8 +40,7 @@ func TestGenerateHAProxy(t *testing.T) {
 		},
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	sup := supervisor.New(cfg, logger)
+	sup := supervisor.New(cfg, newTestLogger())
 
 	// Manually inject "healthy" shards so GenerateHAProxy picks them up
 	// (a fresh supervisor has no running processes, so Status() returns empty)
@@ -94,8 +101,7 @@ func TestGenerateHAProxyLeastConn(t *testing.T) {
 		},
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	sup := supervisor.New(cfg, logger)
+	sup := supervisor.New(cfg, newTestLogger())
 	sup.ManualSetShard("s1", supervisor.ShardProcess{
 		Config: cfg.Shards[0],
 		Status: "healthy",
@@ -126,8 +132,7 @@ func TestGenerateHAProxyOnlyHealthyShards(t *testing.T) {
 		Proxy: &config.ProxyConfig{Enabled: true, BindPort: 9490},
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	sup := supervisor.New(cfg, logger)
+	sup := supervisor.New(cfg, newTestLogger())
 	sup.ManualSetShard("healthy", supervisor.ShardProcess{
 		Config: cfg.Shards[0],
 		Status: "healthy",

@@ -2,17 +2,31 @@
 
 global:
   log_level: info
-  pid_file: /tmp/quack-proxy/quack-proxy.pid
-  status_file: /tmp/quack-proxy/status.json
+  # Windows install layout: paths are relative to the proxy exe directory
+  # ({app}\quack-proxy\) — the database lives beside the NSSM logs in
+  # {app}\data\, the PID/status files in {app}\quack-proxy\run\.
+  pid_file: run/quack-proxy.pid
+  status_file: run/status.json
 
 listener:
   bind_host: 0.0.0.0
   port_start: 9491
   health_interval: 5s
 
+# Read-only status endpoint (GET /status) — all fields optional, defaults shown.
+# The endpoint serves status only (no tokens, no credentials, no control
+# actions), so binding 0.0.0.0 is safe — remote status through a forwarded
+# port or firewall rule is a supported use. Set 127.0.0.1 for local-only
+# setups.
+admin:
+  enabled: true
+  bind_host: 0.0.0.0
+  port: 9490
+
+# NOTE: the Windows installer's default network setup is for a SINGLE
+# shard — install-service.bat opens only the first shard port (9491) and
+# the admin port (9490) in Windows Firewall. Additional shards need their
+# ports opened manually.
 shards:
   - name: analytics
-    database: /tmp/quack-proxy/analytics.db
-
-  - name: logs
-    database: /tmp/quack-proxy/logs.db
+    database: ..\data\analytics.db

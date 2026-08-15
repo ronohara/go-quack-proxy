@@ -31,7 +31,7 @@ shards:
 		t.Fatal(err)
 	}
 
-	cfg, err := Load(cfgPath)
+	cfg, err := Load(cfgPath, tmp, nil)
 	if err != nil {
 		t.Fatalf("Load(): %v", err)
 	}
@@ -82,7 +82,7 @@ shards:
 		t.Fatal(err)
 	}
 
-	cfg, err := Load(cfgPath)
+	cfg, err := Load(cfgPath, tmp, nil)
 	if err != nil {
 		t.Fatalf("Load(): %v", err)
 	}
@@ -153,14 +153,6 @@ shards:
     port: 9500`,
 			wantErr: "duplicate port",
 		},
-		{
-			name: "nonexistent db",
-			yaml: `
-shards:
-  - name: s1
-    database: /nonexistent/path.db`,
-			wantErr: "database file not found",
-		},
 	}
 
 	for _, tt := range tests {
@@ -168,7 +160,7 @@ shards:
 			cfgPath := filepath.Join(tmp, "config.yaml")
 			os.WriteFile(cfgPath, []byte(tt.yaml), 0644)
 
-			_, err := Load(cfgPath)
+			_, err := Load(cfgPath, tmp, nil)
 			if err == nil {
 				t.Fatal("expected error, got nil")
 			}
@@ -177,6 +169,33 @@ shards:
 				t.Errorf("error %q does not contain %q", errStr, tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestLoadAllowsNonexistentDatabase pins the v0.2.0 behavior: config load
+// does NOT validate database existence — the proxy creates missing databases
+// itself (init-db / start). The old load-time "database file not found"
+// validation is gone by design.
+func TestLoadAllowsNonexistentDatabase(t *testing.T) {
+	tmp := t.TempDir()
+	nonexistent := filepath.Join(tmp, "missing", "analytics.db") // directory does not exist
+
+	yaml := `
+shards:
+  - name: s1
+    database: ` + nonexistent + `
+`
+	cfgPath := filepath.Join(tmp, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath, tmp, nil)
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil (databases are created later by init-db/start)", err)
+	}
+	if cfg.Shards[0].Database != nonexistent {
+		t.Errorf("database = %q, want %q (absolute paths pass through unresolved)", cfg.Shards[0].Database, nonexistent)
 	}
 }
 
@@ -200,7 +219,7 @@ proxy:
 		t.Fatal(err)
 	}
 
-	cfg, err := Load(cfgPath)
+	cfg, err := Load(cfgPath, tmp, nil)
 	if err != nil {
 		t.Fatalf("Load(): %v", err)
 	}
@@ -211,6 +230,79 @@ proxy:
 
 	if cfg.Proxy.Mode != "roundrobin" {
 		t.Errorf("proxy mode = %q, want roundrobin", cfg.Proxy.Mode)
+	}
+}
+
+func TestAdminDefaults(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "test.db")
+	if err := os.WriteFile(dbPath, []byte{}, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	yaml := `
+shards:
+  - name: s1
+    database: ` + dbPath + `
+`
+	cfgPath := filepath.Join(tmp, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath, tmp, nil)
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+
+	if cfg.Admin == nil {
+		t.Fatal("admin config is nil — defaults not applied")
+	}
+	if cfg.Admin.Enabled == nil || !*cfg.Admin.Enabled {
+		t.Errorf("default admin.enabled = %v, want true", cfg.Admin.Enabled)
+	}
+	if cfg.Admin.BindHost != "127.0.0.1" {
+		t.Errorf("default admin.bind_host = %q, want 127.0.0.1", cfg.Admin.BindHost)
+	}
+	if cfg.Admin.Port != 9490 {
+		t.Errorf("default admin.port = %d, want 9490", cfg.Admin.Port)
+	}
+}
+
+func TestAdminOverride(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "test.db")
+	if err := os.WriteFile(dbPath, []byte{}, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	yaml := `
+shards:
+  - name: s1
+    database: ` + dbPath + `
+admin:
+  enabled: false
+  bind_host: 0.0.0.0
+  port: 9500
+`
+	cfgPath := filepath.Join(tmp, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath, tmp, nil)
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+
+	if cfg.Admin == nil || cfg.Admin.Enabled == nil || *cfg.Admin.Enabled {
+		t.Error("admin.enabled = false should be respected")
+	}
+	if cfg.Admin.BindHost != "0.0.0.0" {
+		t.Errorf("admin.bind_host = %q, want 0.0.0.0", cfg.Admin.BindHost)
+	}
+	if cfg.Admin.Port != 9500 {
+		t.Errorf("admin.port = %d, want 9500", cfg.Admin.Port)
 	}
 }
 

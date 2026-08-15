@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/alitrack/quack-proxy/internal/logger"
 )
 
 func TestFindConfigArg(t *testing.T) {
@@ -46,7 +48,7 @@ func TestFindConfigArg(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := findConfigArg(tt.args)
+			got, _ := findConfigArg(tt.args, "")
 			if got != tt.want {
 				t.Errorf("findConfigArg(%v) = %q, want %q", tt.args, got, tt.want)
 			}
@@ -77,8 +79,11 @@ func TestWritePIDFile(t *testing.T) {
 }
 
 func TestNewLogger(t *testing.T) {
-	logger := newLogger()
-	if logger == nil {
-		t.Error("newLogger() returned nil")
+	log, err := logger.New(logger.Config{Level: logger.LevelInfo})
+	if err != nil {
+		t.Fatalf("logger.New(): %v", err)
+	}
+	if log == nil {
+		t.Error("logger.New() returned nil")
 	}
 }

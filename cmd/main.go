@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 
 	_ "github.com/duckdb/duckdb-go/v2" // in-process DuckDB engine (CGo)
 
+	"github.com/alitrack/quack-proxy/internal/admin"
 	"github.com/alitrack/quack-proxy/internal/config"
 	"github.com/alitrack/quack-proxy/internal/logger"
 	"github.com/alitrack/quack-proxy/internal/proxy"
@@ -28,7 +31,16 @@ var (
 	quiet      bool
 	logFile    string
 	logJSON    bool
+	// configExplicit records whether -c was given on the command line.
+	// The status command uses it: an explicitly-given missing config is
+	// an error, while a missing DEFAULT config falls back to the built-in
+	// admin defaults.
+	configExplicit bool
 )
+
+// version is the single source of truth for the build version, reported
+// by the version subcommand, the startup log, and the admin /status snapshot.
+const version = "0.3.0"
 
 func init() {
 	flag.StringVar(&configPath, "c", "quack-proxy.yaml", "config file path")
@@ -42,6 +54,12 @@ func init() {
 func main() {
 	flag.Usage = usage
 	flag.Parse()
+
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "c" {
+			configExplicit = true
+		}
+	})
 
 	args := flag.Args()
 	if len(args) < 1 {
@@ -75,7 +93,10 @@ func main() {
 	// Get base directory
 	baseDir := getBaseDir(log)
 
-	cfgPath := findConfigArg(args, baseDir)
+	cfgPath, foundConfig := findConfigArg(args, baseDir)
+	if foundConfig {
+		configExplicit = true
+	}
 
 	switch args[0] {
 	case "start":
@@ -91,7 +112,7 @@ func main() {
 	case "init-db":
 		runInitDB(cfgPath, baseDir, log)
 	case "version":
-		fmt.Println("quack-proxy v0.2.0")
+		fmt.Println("quack-proxy v" + version)
 	default:
 		log.Errorf("unknown command: %s", args[0])
 		usage()
@@ -110,16 +131,16 @@ func getBaseDir(log *logger.Logger) string {
 	return dir
 }
 
-func findConfigArg(args []string, baseDir string) string {
+func findConfigArg(args []string, baseDir string) (string, bool) {
 	for i, a := range args {
 		if a == "-c" && i+1 < len(args) {
-			return resolvePath(args[i+1], baseDir)
+			return resolvePath(args[i+1], baseDir), true
 		}
 		if strings.HasPrefix(a, "-c=") {
-			return resolvePath(strings.TrimPrefix(a, "-c="), baseDir)
+			return resolvePath(strings.TrimPrefix(a, "-c="), baseDir), true
 		}
 	}
-	return resolvePath("quack-proxy.yaml", baseDir)
+	return resolvePath("quack-proxy.yaml", baseDir), false
 }
 
 func resolvePath(path, baseDir string) string {
@@ -199,7 +220,7 @@ func runInitDB(cfgPath string, baseDir string, log *logger.Logger) {
 }
 
 func runStart(cfgPath string, baseDir string, log *logger.Logger) {
-	log.Infof("Starting quack-proxy v0.2.0")
+	log.Infof("Starting quack-proxy v%s", version)
 	log.Verbosef("config file: %s", cfgPath)
 
 	cfg, err := config.Load(cfgPath, baseDir, log)
@@ -234,6 +255,20 @@ func runStart(cfgPath string, baseDir string, log *logger.Logger) {
 
 	go sup.HealthLoop(ctx)
 
+	// Start the read-only admin HTTP endpoint in the background. It shares
+	// the supervisor instance, so GET /status reports the LIVE shard state.
+	// It serves until the process context is canceled (graceful shutdown).
+	if cfg.Admin.Enabled != nil && *cfg.Admin.Enabled {
+		adminSrv := admin.New(sup, version, log)
+		adminAddr := fmt.Sprintf("%s:%d", cfg.Admin.BindHost, cfg.Admin.Port)
+		go func() {
+			log.Infof("admin endpoint listening on http://%s/status", adminAddr)
+			if err := adminSrv.ListenAndServe(ctx, adminAddr); err != nil {
+				log.Errorf("admin server: %v", err)
+			}
+		}()
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
@@ -247,6 +282,7 @@ func runStart(cfgPath string, baseDir string, log *logger.Logger) {
 				continue
 			}
 			log.Infof("config reloaded, shards: %d", len(newCfg.Shards))
+			sup.ReArm()
 		default:
 			log.Infof("shutting down, signal: %v", sig)
 			cancel()
@@ -275,32 +311,70 @@ func runStop(cfgPath string, log *logger.Logger) {
 }
 
 func runStatus(cfgPath string, log *logger.Logger) {
+	// status only needs the admin address. With an explicit -c, a missing
+	// or broken config is an error. Without one, a missing default config
+	// falls back to the built-in admin defaults — the running proxy listens
+	// there unless its own config overrides it.
+	adminAddr := fmt.Sprintf("%s:%d", config.DefaultAdminBindHost, config.DefaultAdminPort)
 	cfg, err := config.Load(cfgPath, "", log)
-	if err != nil {
+	if err == nil {
+		host := cfg.Admin.BindHost
+		if host == "0.0.0.0" || host == "" {
+			// The server bound to all interfaces accepts loopback; probing
+			// 0.0.0.0 directly as a client is unreliable (fails on Windows).
+			host = "127.0.0.1"
+		}
+		adminAddr = fmt.Sprintf("%s:%d", host, cfg.Admin.Port)
+	} else if configExplicit {
 		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
 		os.Exit(1)
 	}
-	sup := supervisor.New(cfg, log)
-	shards := sup.Status()
 
+	// status is an HTTP client: it probes the proxy's admin endpoint so
+	// the data comes from the LIVE process, not a fresh local supervisor.
+	url := fmt.Sprintf("http://%s/status", adminAddr)
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "quack-proxy is not running")
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		fmt.Fprintln(os.Stderr, "this proxy build does not expose /status")
+		os.Exit(1)
+	}
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "unexpected status response: HTTP %d\n", resp.StatusCode)
+		os.Exit(1)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to read status response: %v\n", err)
+		os.Exit(1)
+	}
+
+	// --json passes the remote payload through verbatim.
 	for _, arg := range flag.Args() {
 		if arg == "--json" {
-			output := struct {
-				Shards               []supervisor.ShardProcess `json:"shards"`
-				CoordinatorAttachSQL string                    `json:"coordinator_attach_sql"`
-			}{shards, sup.AttachSQL()}
-			enc := json.NewEncoder(os.Stdout)
-			enc.SetIndent("", "  ")
-			enc.Encode(output)
+			fmt.Println(string(body))
 			return
 		}
 	}
 
+	var snapshot admin.StatusResponse
+	if err := json.Unmarshal(body, &snapshot); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to parse status response: %v\n", err)
+		os.Exit(1)
+	}
+
 	fmt.Printf("%-16s %-6s %-10s %-10s %-8s %s\n", "NAME", "PORT", "STATUS", "UPTIME", "RESTARTS", "DATABASE")
-	for _, s := range shards {
-		uptime := time.Since(s.StartTime).Round(time.Second)
+	for _, s := range snapshot.Shards {
+		uptime := (time.Duration(s.UptimeSeconds) * time.Second).String()
 		fmt.Printf("%-16s %-6d %-10s %-10s %-8d %s\n",
-			s.Config.Name, s.Config.Port, s.Status, uptime, s.Restarts, s.Config.Database)
+			s.Name, s.Port, s.Status, uptime, s.Restarts, s.Database)
 	}
 }
 

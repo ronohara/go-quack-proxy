@@ -11,11 +11,19 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const (
+	// DefaultAdmin* are the built-in admin endpoint defaults, shared by
+	// applyDefaults and the CLI's zero-config status fallback.
+	DefaultAdminBindHost = "127.0.0.1"
+	DefaultAdminPort     = 9490
+)
+
 type Config struct {
-	Global   GlobalConfig    `yaml:"global"`
-	Listener ListenerConfig  `yaml:"listener"`
-	Shards   []ShardConfig   `yaml:"shards"`
-	Proxy    *ProxyConfig     `yaml:"proxy"`
+	Global   GlobalConfig   `yaml:"global"`
+	Listener ListenerConfig `yaml:"listener"`
+	Admin    *AdminConfig   `yaml:"admin"`
+	Shards   []ShardConfig  `yaml:"shards"`
+	Proxy    *ProxyConfig   `yaml:"proxy"`
 }
 
 type GlobalConfig struct {
@@ -31,6 +39,12 @@ type ListenerConfig struct {
 	HealthInterval time.Duration `yaml:"health_interval"`
 }
 
+type AdminConfig struct {
+	Enabled  *bool  `yaml:"enabled"`   // nil = not specified → defaults to true
+	BindHost string `yaml:"bind_host"` // default 127.0.0.1 — local-only unless overridden
+	Port     int    `yaml:"port"`      // default 9490 (quack shards start at 9491)
+}
+
 type ShardConfig struct {
 	Name     string `yaml:"name"`
 	Database string `yaml:"database"`
@@ -40,11 +54,11 @@ type ShardConfig struct {
 }
 
 type ProxyConfig struct {
-	Enabled   bool       `yaml:"enabled"`
-	Output    string     `yaml:"output"`
-	BindPort  int        `yaml:"bind_port"`
-	Mode      string     `yaml:"mode"`
-	SSL       *SSLConfig `yaml:"ssl"`
+	Enabled  bool       `yaml:"enabled"`
+	Output   string     `yaml:"output"`
+	BindPort int        `yaml:"bind_port"`
+	Mode     string     `yaml:"mode"`
+	SSL      *SSLConfig `yaml:"ssl"`
 }
 
 type SSLConfig struct {
@@ -97,6 +111,21 @@ func (c *Config) applyDefaults(baseDir string) {
 	}
 	if c.Listener.HealthInterval == 0 {
 		c.Listener.HealthInterval = 5 * time.Second
+	}
+
+	// Admin defaults: enabled unless the section explicitly disables it.
+	if c.Admin == nil {
+		c.Admin = &AdminConfig{}
+	}
+	if c.Admin.Enabled == nil {
+		def := true
+		c.Admin.Enabled = &def
+	}
+	if c.Admin.BindHost == "" {
+		c.Admin.BindHost = DefaultAdminBindHost
+	}
+	if c.Admin.Port == 0 {
+		c.Admin.Port = DefaultAdminPort
 	}
 
 	// Resolve paths relative to baseDir

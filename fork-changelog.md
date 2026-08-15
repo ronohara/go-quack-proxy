@@ -1,5 +1,50 @@
 # quack-proxy Changelog
 
+> **Fork provenance.** This repository is a fork of
+> [alitrack/quack-proxy](https://github.com/alitrack/quack-proxy) (MIT).
+> Upstream is frozen: a one-shot upload on 2026-05-29, final upstream commit
+> `e05cc4f`, zero commits since. Everything after that point is this fork's
+> own work. Divergence from upstream:
+>
+> - v0.1.1 (2026-06-27): logging levels, base-directory awareness, path
+>   resolution
+> - v0.2.0 (2026-08-15): Option B — in-process DuckDB engine via CGo, new
+>   `init-db` subcommand (see the v0.2.0 section below)
+> - NSSM service deployment pattern: the service runs with **no config path
+>   argument** so NSSM cannot mangle it; the proxy resolves `quack-proxy.yaml`
+>   next to its own executable
+> - Status enhancement (admin HTTP endpoint + remote-capable CLI `status`) —
+>   implemented (v0.3.0; verification pending — see the plan's Items 9–13)
+
+## v0.3.0 – Status enhancement (implementation landed; verification pending)
+
+### Added
+- Admin HTTP endpoint (`GET /status`, default `127.0.0.1:9490`) exposing a live
+  JSON snapshot of the running proxy: `version`, `pid`, `started_at`,
+  per-shard status/uptime/restarts with token masking, and `attach_sql`
+  (new `internal/admin` package; the token is never serialised — `token_set` only)
+- CLI `status` reworked as an HTTP client against the admin endpoint — table
+  rendering unchanged, `--json` passes the remote payload through verbatim;
+  error cases: `quack-proxy is not running` (connection refused, exit 1) and
+  `this proxy build does not expose /status` (HTTP 404 from an older build)
+- Zero-config `status`: with no `-c` given and no default config file next to
+  the executable, the CLI probes the built-in admin defaults
+  (`127.0.0.1:9490`); an explicitly-given missing config is still an error
+- `admin:` config section (`enabled`, `bind_host`, `port`) with defaults
+  (true / `127.0.0.1` / `9490`), wired in `internal/config` and documented in
+  `quack-proxy.example.yaml` (unauthenticated endpoint — widening the bind
+  is dev-only)
+- Admin package tests: JSON shape, token masking, 404 on unknown paths, 405
+  on non-GET (4 tests)
+
+### Known Issues
+- Loopback port-squatter edge: a specific-address listener on a shard's port
+  (e.g. `127.0.0.1:9491`) makes restarts *succeed* while health checks keep
+  failing — `restarts` climbs indefinitely and the give-up threshold (keyed
+  to failed restarts) never fires. Observed on Windows, where SO_REUSEADDR
+  permits the wildcard bind alongside the specific one. The climbing
+  `restarts` value remains the visible crash-loop signal.
+
 ## v0.2.0 – 2026-08-15 — Option B: in-process DuckDB engine
 
 ### Added
