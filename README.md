@@ -24,6 +24,19 @@ quack-proxy does all of this with a single YAML and a single binary.
 
 ---
 
+## Why a fork?
+
+The original repository still has a reference to nightly builds and we noticed as few things
+
+- One-shot upload — zero commits since creation. Effectively frozen upstream.
+- Stars / forks / open issues  4 / 1 / 0  No user base, no issue traffic.
+- Windows-related issues ever filed  0  No one has attempted a Windows deployment before us.
+- Service-related issues ever filed  0  Same for service/daemon use.
+
+So the fork includes a couple of major enhancements aimed at making DuckDB Quack a viable multi user database choice in a Windwos machine
+
+---
+
 ## Quick Start
 
 ### One-Click (No Go install needed)
